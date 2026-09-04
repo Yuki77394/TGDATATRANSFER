@@ -64,17 +64,25 @@ class MigrationConfig:
         self.logs_dir: Path = self.data_dir / "logs"
 
         # State files
-        self.state_file: Path = self.state_dir / "migration_state.json"
+        self.db_path: Path = self.state_dir / "migration.db"
+        self.state_file: Path = self.state_dir / "migration_state.json"  # legacy, for migration
         self.failed_messages_file: Path = self.failed_dir / "failed_messages.jsonl"
         self.log_file: Path = self.logs_dir / "migration.log"
 
         # --- Reliability ---
-        self.max_retries: int = max(1, _as_int(os.getenv("MAX_RETRIES"), 3))
+        self.max_retries: int = max(1, _as_int(os.getenv("MAX_RETRIES"), 5))
         self.checkpoint_every: int = max(1, _as_int(os.getenv("CHECKPOINT_EVERY"), 10))
 
         # --- Safety overrides ---
         self.allow_same_account: bool = _as_bool(os.getenv("ALLOW_SAME_ACCOUNT"), False)
         self.delete_after_upload: bool = _as_bool(os.getenv("DELETE_AFTER_UPLOAD"), False)
+
+        # --- Reconciliation ---
+        # When recovering from an 'uploading' crash, check the last N target
+        # Saved Messages for a potential duplicate before re-uploading.
+        self.reconciliation_window: int = max(
+            1, _as_int(os.getenv("RECONCILIATION_WINDOW"), 20)
+        )
 
     def validate(self) -> None:
         """Validate that required configuration is present. Raises ValueError."""
@@ -115,8 +123,10 @@ class MigrationConfig:
             "source_session_set": bool(self.source_session),
             "target_session_set": bool(self.target_session),
             "data_dir": str(self.data_dir),
+            "db_path": str(self.db_path),
             "max_retries": self.max_retries,
             "checkpoint_every": self.checkpoint_every,
             "allow_same_account": self.allow_same_account,
             "delete_after_upload": self.delete_after_upload,
+            "reconciliation_window": self.reconciliation_window,
         }

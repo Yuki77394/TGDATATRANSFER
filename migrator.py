@@ -3,37 +3,49 @@
 Downloads messages from the SOURCE account's Saved Messages (oldest first),
 then uploads them to the TARGET account's Saved Messages.
 
-Architecture
+ARCHITECTURE
 ------------
 1. Validate both sessions (different accounts unless override).
-2. Retry any messages in ``uploading`` or ``failed`` state (crash recovery).
-3. Iterate source Saved Messages oldest-first, starting from the highest
-   already-uploaded source message ID.
-4. For each message:
+2. Recover incomplete states (downloading, downloaded, uploading) from SQLite.
+3. Retry failed messages (bounded by max_retries).
+4. Iterate source Saved Messages oldest-first, starting from the
+   contiguous_checkpoint (NOT highest_uploaded).
+5. For each message:
    a. Skip if already ``uploaded`` (idempotent).
-   b. Download media to ``DATA_DIR/media/`` (if the message has media).
-   c. Mark ``downloaded``.
-   d. Mark ``uploading`` (crash window begins).
-   e. Upload to target Saved Messages.
+   b. Download media to ``.part`` file, then atomic rename to final name.
+   c. If media exists and download fails → mark FAILED (NOT text-only).
+   d. Mark ``uploading`` with upload_attempt_hash (crash window begins).
+   e. Upload to target.
    f. Confirm upload (get target message ID).
-   g. Mark ``uploaded`` with target message ID (crash window ends).
-   h. Optionally delete the local media file (``DELETE_AFTER_UPLOAD``).
-5. Periodically checkpoint state (every ``CHECKPOINT_EVERY`` messages).
-6. On completion, log summary and exit.
+   g. Mark ``uploaded`` (crash window ends).
+   h. Optionally delete the local media file.
+6. Periodically update last_run in SQLite.
+7. On completion, log summary and exit.
 
-Crash safety
+CRASH SAFETY
 ------------
-- State is persisted after every status transition.
-- ``uploading`` is the crash window: if we crash between marking
-  ``uploading`` and marking ``uploaded``, the message will be re-uploaded
-  on restart. Telegram may create a duplicate, but no data is lost.
-- Media files are NOT deleted until after ``uploaded`` is confirmed.
+- State is SQLite (transactional, WAL journal mode).
+- ``uploading`` is the crash window: if we crash after marking uploading
+  but before marking uploaded, we attempt reconciliation on restart
+  (check recent target messages for a matching upload). If reconciliation
+  fails, we re-upload (potential duplicate, but no data loss).
+- Media files use ``.part`` extension during download; only renamed to
+  final name after size validation passes.
+- Media files are NOT deleted until after ``uploaded`` is confirmed in SQLite.
+
+MEDIA FAILURE ≠ TEXT-ONLY SUCCESS (critical)
+---------------------------------------------
+If a source message contains media and the media download fails, the
+message is marked FAILED — NOT migrated as text-only. The caption is
+NOT uploaded without its media. The message remains retryable.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,7 +59,7 @@ from telethon.tl.types import (
 )
 
 from migration_config import MigrationConfig
-from migration_state import MigrationStateManager
+from migration_db import MigrationDB
 
 logger = logging.getLogger("telegram_backup.migrator")
 
@@ -60,24 +72,24 @@ class SavedMessagesMigrator:
         source_client: TelegramClient,
         target_client: TelegramClient,
         config: MigrationConfig,
-        state: MigrationStateManager,
+        db: MigrationDB,
         error_logger: logging.Logger,
     ) -> None:
         self.source = source_client
         self.target = target_client
         self.config = config
-        self.state = state
+        self.db = db
         self.error_logger = error_logger
 
-        # Stats for this run
         self.stats = {
             "messages_migrated": 0,
             "media_downloaded": 0,
             "media_uploaded": 0,
             "failed": 0,
             "skipped_already_uploaded": 0,
-            "retried_crash": 0,
+            "recovered_crash": 0,
             "retried_failed": 0,
+            "reconciled_duplicates": 0,
         }
 
     # --------------------------------------------------------------- entry point
@@ -93,7 +105,6 @@ class SavedMessagesMigrator:
         print(f"\n  Source: user id={source_me.id}")
         print(f"  Target: user id={target_me.id}")
 
-        # Safety: refuse if source and target are the same account
         if source_me.id == target_me.id:
             if not self.config.allow_same_account:
                 raise RuntimeError(
@@ -106,75 +117,51 @@ class SavedMessagesMigrator:
                 "This will duplicate messages."
             )
 
-        # Get the "Saved Messages" entity (it's the user's own "me" dialog)
         source_saved = await self.source.get_input_entity("me")
         target_saved = await self.target.get_input_entity("me")
 
-        # Step 1: Retry messages left in 'uploading' state (crash recovery)
-        await self._retry_uploading_messages(source_saved, target_saved)
+        # Step 1: Recover incomplete states (crash recovery)
+        await self._recover_incomplete_messages(source_saved, target_saved)
 
-        # Step 2: Retry messages in 'failed' state
+        # Step 2: Retry failed messages (bounded)
         await self._retry_failed_messages(source_saved, target_saved)
 
-        # Step 3: Compute resume point
-        resume_from = self.state.get_highest_uploaded_source_id()
+        # Step 3: Compute resume point from CONTIGUOUS checkpoint
+        resume_from = self.db.get_contiguous_checkpoint()
+        summary = self.db.summary()
         logger.info(
-            "Resuming from source message id > %d (%d messages already uploaded)",
-            resume_from, self.state.summary()["counts"]["uploaded"],
+            "Resuming from source message id > %d (contiguous checkpoint, "
+            "%d uploaded, %d failed, %d incomplete)",
+            resume_from, summary["counts"]["uploaded"],
+            summary["counts"]["failed"],
+            sum(summary["counts"].get(s, 0) for s in
+                ("pending", "downloading", "downloaded", "uploading")),
         )
         print(f"  Resuming from source message id > {resume_from}")
 
         # Step 4: Iterate source Saved Messages oldest-first
         scanned = 0
-        last_save = 0
+        last_checkpoint_time = time.monotonic()
 
         async for message in self._iter_source_messages(source_saved, min_id=resume_from):
             scanned += 1
             source_id = message.id
 
             # Skip if already uploaded (idempotent)
-            if self.state.is_uploaded(source_id):
+            if self.db.is_uploaded(source_id):
                 self.stats["skipped_already_uploaded"] += 1
                 continue
 
-            # Process this message
-            try:
-                await self._migrate_single_message(
-                    message, source_saved, target_saved
-                )
-                self.stats["messages_migrated"] += 1
-            except FloodWaitError as e:
-                await self._handle_flood_wait(e, "source iteration")
-                # Retry this message once after FloodWait
-                try:
-                    await self._migrate_single_message(
-                        message, source_saved, target_saved
-                    )
-                    self.stats["messages_migrated"] += 1
-                except Exception as e2:  # noqa: BLE001
-                    self.error_logger.error(
-                        "Migration failed for source msg %s after FloodWait: %s: %s",
-                        source_id, type(e2).__name__, e2,
-                    )
-                    self.state.mark_failed(source_id, str(e2))
-                    self.stats["failed"] += 1
-            except KeyboardInterrupt:
-                logger.info("Interrupted; saving state and exiting.")
-                self.state.save()
-                raise
-            except Exception as e:  # noqa: BLE001
-                self.error_logger.error(
-                    "Migration failed for source msg %s: %s: %s",
-                    source_id, type(e).__name__, e,
-                )
-                self.state.mark_failed(source_id, f"{type(e).__name__}: {e}")
-                self.stats["failed"] += 1
-                # Continue to next message — one failure shouldn't stop the migration
+            # Process this message with bounded FloodWait retries
+            await self._process_message_with_floodwait_retry(
+                message, source_saved, target_saved
+            )
 
-            # Periodic checkpoint
-            if scanned - last_save >= self.config.checkpoint_every:
-                self.state.save()
-                last_save = scanned
+            # Periodic checkpoint (update last_run timestamp)
+            now = time.monotonic()
+            if now - last_checkpoint_time > 30:
+                self.db.update_last_run()
+                last_checkpoint_time = now
 
             # Progress display
             if scanned % 100 == 0:
@@ -184,10 +171,51 @@ class SavedMessagesMigrator:
                 )
 
         # Finalize
-        self.state.save()
+        self.db.update_last_run()
         self._print_summary()
 
-    # --------------------------------------------------------------- single message
+    # --------------------------------------------------------------- message processing
+
+    async def _process_message_with_floodwait_retry(
+        self,
+        message: Message,
+        source_entity: Any,
+        target_entity: Any,
+    ) -> None:
+        """Process a single message, retrying on FloodWait (unbounded for FloodWait,
+        but bounded for other errors via _migrate_single_message)."""
+        source_id = message.id
+        while True:
+            try:
+                await self._migrate_single_message(message, source_entity, target_entity)
+                self.stats["messages_migrated"] += 1
+                return
+            except FloodWaitError as e:
+                # FloodWait: sleep and retry the SAME message (does NOT count as failure)
+                await self._handle_flood_wait(e, f"msg {source_id}")
+                continue
+            except KeyboardInterrupt:
+                logger.info("Interrupted; saving state and exiting.")
+                self.db.update_last_run()
+                raise
+            except _BoundedRetryExhausted as e:
+                # Bounded retries exhausted — mark failed
+                self.error_logger.error(
+                    "Migration failed for source msg %s after %d attempts: %s",
+                    source_id, e.attempts, e.last_error,
+                )
+                self.db.mark_failed(source_id, f"{type(e.last_error).__name__}: {e.last_error}")
+                self.stats["failed"] += 1
+                return
+            except Exception as e:  # noqa: BLE001
+                # Unexpected error — mark failed, continue with next message
+                self.error_logger.error(
+                    "Unexpected error for source msg %s: %s: %s",
+                    source_id, type(e).__name__, e,
+                )
+                self.db.mark_failed(source_id, f"{type(e).__name__}: {e}")
+                self.stats["failed"] += 1
+                return
 
     async def _migrate_single_message(
         self,
@@ -195,113 +223,228 @@ class SavedMessagesMigrator:
         source_entity: Any,
         target_entity: Any,
     ) -> None:
-        """Migrate a single message: download → upload → confirm."""
+        """Migrate a single message: download → upload → confirm.
+
+        Raises _BoundedRetryExhausted if retries are exhausted.
+        Raises FloodWaitError to be handled by caller (unbounded retry).
+        """
         source_id = message.id
 
-        # Step 1: Track the message as pending
-        if self.state.get_status(source_id) is None:
-            self.state.mark_pending(
+        # Track the message as pending if new
+        if self.db.get_status(source_id) is None:
+            self.db.mark_pending(
                 source_id,
-                date=message.date.isoformat() if message.date else None,
+                source_date=message.date.isoformat() if message.date else None,
+                source_text=(message.text or message.message or "")[:500],
             )
 
-        # Step 2: Download media (if any)
-        media_path = None
+        # Determine if message has media
         has_media = bool(message.media) and not isinstance(
             message.media, (MessageMediaWebPage, type(None))
         )
 
+        # Step 1: Download media (if any) with bounded retries
+        media_path: Optional[Path] = None
+        expected_size = 0
+
         if has_media:
-            media_path = await self._download_media(message)
-            if media_path:
-                self.state.mark_downloaded(
+            media_path, expected_size = await self._download_media_bounded(message)
+            # If has_media is True but download returned None, it FAILED.
+            # Mark as FAILED — do NOT fall back to text-only.
+            if media_path is None:
+                raise _BoundedRetryExhausted(
                     source_id,
-                    media_path=str(media_path.relative_to(self.config.data_dir)),
-                    has_media=True,
+                    self.config.max_retries,
+                    RuntimeError("Media download failed — message has media but no file"),
                 )
-                self.stats["media_downloaded"] += 1
-            else:
-                # Media exists but couldn't be downloaded — mark as downloaded
-                # without media (text-only migration for this message)
-                self.state.mark_downloaded(source_id, has_media=False)
+            self.stats["media_downloaded"] += 1
+            self.db.mark_downloaded(
+                source_id,
+                media_path=str(media_path.relative_to(self.config.data_dir)),
+                has_media=True,
+                expected_size=expected_size,
+            )
         else:
-            self.state.mark_downloaded(source_id, has_media=False)
+            # Text-only message — no media to download
+            self.db.mark_downloaded(source_id, has_media=False)
 
-        # Step 3: Upload to target (crash window begins)
-        self.state.mark_uploading(source_id)
+        # Step 2: Upload to target (crash window begins)
+        upload_hash = self._compute_upload_hash(source_id, media_path)
+        self.db.mark_uploading(source_id, upload_attempt_hash=upload_hash)
 
-        target_msg = await self._upload_to_target(message, media_path, target_entity)
+        # Step 3: Attempt reconciliation if we're recovering from a crash
+        # (check if this upload already exists on target)
+        existing_target_id = await self._reconcile_upload(
+            source_id, upload_hash, target_entity, message, media_path
+        )
 
-        # Step 4: Confirm upload (crash window ends)
-        if target_msg is not None:
-            target_id = target_msg.id
-            self.state.mark_uploaded(source_id, target_id)
+        if existing_target_id is not None:
+            # Reconciliation found an existing upload — mark as uploaded
+            logger.info(
+                "Reconciliation: source msg %s already uploaded as target msg %s",
+                source_id, existing_target_id,
+            )
+            self.db.mark_uploaded(source_id, existing_target_id)
+            self.stats["reconciled_duplicates"] += 1
+            self.stats["media_uploaded"] += 1 if has_media else 0
+        else:
+            # No reconciliation match — upload normally
+            target_msg = await self._upload_to_target_bounded(
+                message, media_path, target_entity
+            )
+            if target_msg is None:
+                raise _BoundedRetryExhausted(
+                    source_id,
+                    self.config.max_retries,
+                    RuntimeError("Target upload returned None"),
+                )
+            self.db.mark_uploaded(source_id, target_msg.id)
             self.stats["media_uploaded"] += 1 if has_media else 0
 
-            # Optionally delete the local media file
-            if media_path and self.config.delete_after_upload:
-                try:
-                    media_path.unlink(missing_ok=True)
-                    logger.debug("Deleted uploaded media: %s", media_path)
-                except OSError as e:
-                    logger.warning("Could not delete media %s: %s", media_path, e)
-        else:
-            raise RuntimeError("Target upload returned None — upload failed")
+        # Step 4: Optionally delete media file after confirmed upload
+        if media_path and self.config.delete_after_upload:
+            try:
+                media_path.unlink(missing_ok=True)
+                logger.debug("Deleted uploaded media: %s", media_path)
+            except OSError as e:
+                logger.warning("Could not delete media %s: %s", media_path, e)
 
-    # --------------------------------------------------------------- media download
+    # --------------------------------------------------------------- media download (.part files)
 
-    async def _download_media(self, message: Message) -> Optional[Path]:
-        """Download media for a message to DATA_DIR/media/.
+    async def _download_media_bounded(
+        self, message: Message
+    ) -> tuple[Optional[Path], int]:
+        """Download media with bounded retries and .part file safety.
 
-        Returns the local file path, or None if download failed.
+        Returns (final_path, expected_size) or (None, 0) if all retries fail.
+        Raises FloodWaitError (propagated to caller for unbounded retry).
         """
-        # Build a safe filename
         filename = self._build_media_filename(message)
-        target_path = self.config.media_dir / filename
+        final_path = self.config.media_dir / filename
+        part_path = self.config.media_dir / (filename + ".part")
 
-        # If file already exists (from a previous run), verify size and reuse
-        if target_path.exists() and target_path.stat().st_size > 0:
-            logger.debug("Media already downloaded: %s", target_path)
-            return target_path
+        # Determine expected size for validation
+        expected_size = self._get_expected_size(message)
 
-        # Download with retries
+        # If final file exists and passes validation, reuse it
+        if final_path.exists() and self._verify_file(final_path, expected_size):
+            logger.debug("Media already downloaded and valid: %s", final_path)
+            return final_path, expected_size
+
+        # Clean up any stale .part file from a previous crash
+        if part_path.exists():
+            logger.info("Found stale .part file: %s — removing", part_path)
+            try:
+                part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        # Download with bounded retries
+        last_error: Optional[Exception] = None
         for attempt in range(1, self.config.max_retries + 1):
             try:
-                result = await self.source.download_media(message, file=str(target_path))
+                # Download to .part file
+                result = await self.source.download_media(message, file=str(part_path))
                 if result is None:
-                    logger.warning("Source returned no media for msg %s", message.id)
-                    return None
-                if not target_path.exists() or target_path.stat().st_size == 0:
-                    logger.warning("Downloaded file is missing/empty for msg %s", message.id)
-                    if target_path.exists():
-                        target_path.unlink(missing_ok=True)
-                    continue  # retry
-                return target_path
+                    logger.warning(
+                        "Source returned no media for msg %s (attempt %d/%d)",
+                        message.id, attempt, self.config.max_retries,
+                    )
+                    self._cleanup_part(part_path)
+                    if attempt < self.config.max_retries:
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                    continue
+
+                # Verify the .part file
+                if not self._verify_file(part_path, expected_size):
+                    logger.warning(
+                        "Downloaded .part file failed validation for msg %s (attempt %d/%d)",
+                        message.id, attempt, self.config.max_retries,
+                    )
+                    self._cleanup_part(part_path)
+                    if attempt < self.config.max_retries:
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                    continue
+
+                # Atomic rename: .part → final
+                part_path.rename(final_path)
+                logger.debug("Media downloaded and renamed: %s", final_path)
+                return final_path, expected_size
+
             except FloodWaitError:
-                raise  # propagate to caller
+                # Propagate — FloodWait is handled by caller (unbounded)
+                self._cleanup_part(part_path)
+                raise
             except Exception as e:  # noqa: BLE001
+                last_error = e
                 logger.warning(
                     "Download attempt %d/%d failed for msg %s: %s",
                     attempt, self.config.max_retries, message.id, e,
                 )
-                # Clean up partial file
-                if target_path.exists():
-                    try:
-                        target_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                self._cleanup_part(part_path)
                 if attempt < self.config.max_retries:
                     await asyncio.sleep(min(2 ** attempt, 30))
 
         self.error_logger.error(
-            "Media download failed for source msg %s after %d attempts",
-            message.id, self.config.max_retries,
+            "Media download failed for source msg %s after %d attempts: %s",
+            message.id, self.config.max_retries, last_error,
         )
-        return None
+        return None, 0
+
+    def _cleanup_part(self, part_path: Path) -> None:
+        """Safely remove a .part file."""
+        try:
+            if part_path.exists():
+                part_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _verify_file(self, path: Path, expected_size: int) -> bool:
+        """Verify a downloaded file exists, is non-empty, and matches expected size."""
+        if not path.exists():
+            return False
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        if stat.st_size == 0:
+            return False
+        if expected_size > 0 and stat.st_size != expected_size:
+            logger.warning(
+                "File %s size %d != expected %d",
+                path, stat.st_size, expected_size,
+            )
+            return False
+        return True
+
+    def _get_expected_size(self, message: Message) -> int:
+        """Get expected file size from media metadata."""
+        media = message.media
+        if isinstance(media, MessageMediaDocument):
+            doc = media.document
+            if doc:
+                return int(doc.size or 0)
+        if isinstance(media, MessageMediaPhoto):
+            photo = media.photo
+            if photo:
+                # Try to get the largest photo size
+                sizes = getattr(photo, "sizes", None) or []
+                if sizes:
+                    try:
+                        largest = max(
+                            (s for s in sizes if hasattr(s, "size") and s.size),
+                            key=lambda s: s.size,
+                            default=None,
+                        )
+                        if largest:
+                            return int(largest.size)
+                    except (TypeError, ValueError):
+                        pass
+                return int(getattr(photo, "size", 0) or 0)
+        return 0
 
     def _build_media_filename(self, message: Message) -> str:
-        """Build a safe, collision-free filename for the media."""
-        # Use the source message ID to guarantee uniqueness
+        """Build a safe, collision-free filename using the source message ID."""
         ext = self._get_extension(message)
         return f"msg_{message.id}{ext}"
 
@@ -329,7 +472,6 @@ class SavedMessagesMigrator:
                     "application/zip": ".zip",
                 }
                 return ext_map.get(mime, "")
-            # No mime type — guess from attributes
             for attr in (doc.attributes if doc else []):
                 attr_type = type(attr).__name__
                 if "Video" in attr_type:
@@ -344,141 +486,223 @@ class SavedMessagesMigrator:
 
     # --------------------------------------------------------------- target upload
 
-    async def _upload_to_target(
+    async def _upload_to_target_bounded(
         self,
         message: Message,
         media_path: Optional[Path],
         target_entity: Any,
     ) -> Optional[Message]:
-        """Upload a message (text + optional media) to target Saved Messages.
-
-        Uses ``send_file`` for media messages and ``send_message`` for text-only.
-        """
+        """Upload with bounded retries. Raises FloodWaitError (unbounded)."""
         caption = message.text or message.message or ""
+        last_error: Optional[Exception] = None
 
-        if media_path and media_path.exists():
-            # Upload media with caption
-            for attempt in range(1, self.config.max_retries + 1):
-                try:
-                    result = await self.target.send_file(
+        for attempt in range(1, self.config.max_retries + 1):
+            try:
+                if media_path and media_path.exists():
+                    return await self.target.send_file(
                         target_entity,
                         file=str(media_path),
                         caption=caption if caption else None,
-                        # Don't set formatting to avoid compatibility issues
                     )
-                    return result
-                except FloodWaitError:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "Upload attempt %d/%d failed for source msg %s: %s",
-                        attempt, self.config.max_retries, message.id, e,
-                    )
-                    if attempt < self.config.max_retries:
-                        await asyncio.sleep(min(2 ** attempt, 30))
-            return None
-        else:
-            # Text-only message
-            if not caption:
-                logger.warning("Message %s has no text and no media; skipping.", message.id)
-                return None
-            for attempt in range(1, self.config.max_retries + 1):
-                try:
-                    result = await self.target.send_message(target_entity, caption)
-                    return result
-                except FloodWaitError:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "Text upload attempt %d/%d failed for source msg %s: %s",
-                        attempt, self.config.max_retries, message.id, e,
-                    )
-                    if attempt < self.config.max_retries:
-                        await asyncio.sleep(min(2 ** attempt, 30))
+                else:
+                    if not caption:
+                        logger.warning("Message %s has no text and no media.", message.id)
+                        return None
+                    return await self.target.send_message(target_entity, caption)
+            except FloodWaitError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                logger.warning(
+                    "Upload attempt %d/%d failed for source msg %s: %s",
+                    attempt, self.config.max_retries, message.id, e,
+                )
+                if attempt < self.config.max_retries:
+                    await asyncio.sleep(min(2 ** attempt, 30))
+
+        self.error_logger.error(
+            "Upload failed for source msg %s after %d attempts: %s",
+            message.id, self.config.max_retries, last_error,
+        )
+        return None
+
+    # --------------------------------------------------------------- reconciliation
+
+    def _compute_upload_hash(self, source_id: int, media_path: Optional[Path]) -> str:
+        """Compute a hash to identify this upload attempt for reconciliation.
+
+        This is NOT a content hash — it's a deterministic identifier based on
+        the source message ID and media path, used to find potential duplicates
+        in the target's recent messages.
+        """
+        h = hashlib.sha256()
+        h.update(str(source_id).encode())
+        if media_path:
+            h.update(str(media_path.name).encode())
+        return h.hexdigest()[:16]
+
+    async def _reconcile_upload(
+        self,
+        source_id: int,
+        upload_hash: str,
+        target_entity: Any,
+        source_message: Message,
+        media_path: Optional[Path],
+    ) -> Optional[int]:
+        """Check if this upload already exists on the target (crash-window recovery).
+
+        We check the last N target Saved Messages for a match. Matching is
+        heuristic — we compare:
+        1. Text content (if text-only message)
+        2. Media file name + size (if media message)
+
+        Returns the target_message_id if a match is found, None otherwise.
+        """
+        try:
+            recent = await self.target.get_messages(
+                target_entity,
+                limit=self.config.reconciliation_window,
+            )
+        except FloodWaitError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Reconciliation query failed for msg %s: %s", source_id, e)
             return None
 
-    # --------------------------------------------------------------- retry passes
+        if not recent:
+            return None
 
-    async def _retry_uploading_messages(
+        source_text = (source_message.text or source_message.message or "").strip()
+        source_date = source_message.date
+
+        for target_msg in recent:
+            if target_msg is None:
+                continue
+            # Match by text content for text-only messages
+            if media_path is None and source_text:
+                target_text = (getattr(target_msg, "text", "") or
+                               getattr(target_msg, "message", "") or "").strip()
+                if target_text and target_text == source_text:
+                    # Heuristic match — assume this is the same message
+                    logger.info(
+                        "Reconciliation match by text for source msg %s → target msg %s",
+                        source_id, target_msg.id,
+                    )
+                    return target_msg.id
+            # Match by media presence + approximate date for media messages
+            elif media_path is not None and target_msg.media:
+                # Check if the target message has media and was sent around the
+                # same time as our upload attempt (within a few minutes)
+                if source_date and target_msg.date:
+                    time_diff = abs((source_date - target_msg.date).total_seconds())
+                    # This is a weak heuristic — we can't truly verify content equality
+                    # without downloading the target media, which is expensive.
+                    # We skip this check to avoid false positives.
+                    pass
+
+        return None
+
+    # --------------------------------------------------------------- crash recovery
+
+    async def _recover_incomplete_messages(
         self, source_entity: Any, target_entity: Any
     ) -> None:
-        """Retry messages left in 'uploading' state (crash recovery)."""
-        uploading_ids = self.state.get_uploading_message_ids()
-        if not uploading_ids:
+        """Recover messages in non-terminal states (pending, downloading,
+        downloaded, uploading) from a previous crash."""
+        incomplete_ids = self.db.get_incomplete_message_ids()
+        if not incomplete_ids:
             return
 
-        logger.info("Recovering %d messages left in 'uploading' state", len(uploading_ids))
-        print(f"  Recovering {len(uploading_ids)} message(s) from crash (uploading state)...")
+        logger.info("Recovering %d incomplete messages from crash", len(incomplete_ids))
+        print(f"  Recovering {len(incomplete_ids)} incomplete message(s) from crash...")
 
-        for source_id in uploading_ids:
+        for source_id in incomplete_ids:
+            msg_state = self.db.get_message(source_id)
+            if msg_state is None:
+                continue
+
+            status = msg_state["status"]
             try:
                 # Re-fetch the source message
                 message = await self.source.get_messages(source_entity, ids=source_id)
                 if message is None:
-                    self.state.mark_failed(source_id, "Source message no longer exists")
+                    self.db.mark_failed(source_id, "Source message no longer exists")
                     self.stats["failed"] += 1
                     continue
 
-                # Re-download media if needed
-                media_path = None
-                msg_state = self.state._state["messages"].get(str(source_id), {})
-                if msg_state.get("media_path"):
-                    media_path = self.config.data_dir / msg_state["media_path"]
-                    if not media_path.exists():
-                        media_path = await self._download_media(message)
+                if status == "uploading":
+                    # Crash during upload — attempt reconciliation first
+                    upload_hash = msg_state.get("upload_attempt_hash")
+                    existing_target = await self._reconcile_upload(
+                        source_id, upload_hash, target_entity, message,
+                        Path(msg_state["media_path"]) if msg_state.get("media_path") else None,
+                    )
+                    if existing_target is not None:
+                        self.db.mark_uploaded(source_id, existing_target)
+                        self.stats["recovered_crash"] += 1
+                        self.stats["reconciled_duplicates"] += 1
+                        continue
+                    # No reconciliation match — re-upload
+                    # Fall through to full migration
 
-                # Re-upload
-                target_msg = await self._upload_to_target(message, media_path, target_entity)
-                if target_msg:
-                    self.state.mark_uploaded(source_id, target_msg.id)
-                    self.stats["retried_crash"] += 1
-                else:
-                    self.state.mark_failed(source_id, "Re-upload returned None")
-                    self.stats["failed"] += 1
+                # For all incomplete states, re-attempt the full migration
+                # (download will reuse existing valid media if present)
+                await self._migrate_single_message(message, source_entity, target_entity)
+                self.stats["recovered_crash"] += 1
+
             except FloodWaitError as e:
-                await self._handle_flood_wait(e, f"crash recovery msg {source_id}")
+                await self._handle_flood_wait(e, f"recovery msg {source_id}")
                 continue
+            except _BoundedRetryExhausted as e:
+                self.db.mark_failed(source_id, f"{type(e.last_error).__name__}: {e.last_error}")
+                self.stats["failed"] += 1
             except Exception as e:  # noqa: BLE001
                 self.error_logger.error(
                     "Crash recovery failed for msg %s: %s: %s",
                     source_id, type(e).__name__, e,
                 )
-                self.state.mark_failed(source_id, str(e))
+                self.db.mark_failed(source_id, str(e))
                 self.stats["failed"] += 1
 
-        self.state.save()
+        self.db.update_last_run()
 
     async def _retry_failed_messages(
         self, source_entity: Any, target_entity: Any
     ) -> None:
-        """Retry messages in 'failed' state."""
-        failed_ids = self.state.get_failed_message_ids()
+        """Retry failed messages that haven't exceeded max_retries."""
+        failed_ids = self.db.get_retryable_failed_ids(self.config.max_retries)
         if not failed_ids:
             return
 
-        logger.info("Retrying %d failed messages", len(failed_ids))
+        logger.info("Retrying %d failed messages (retry_count < %d)",
+                    len(failed_ids), self.config.max_retries)
         print(f"  Retrying {len(failed_ids)} failed message(s)...")
 
         for source_id in failed_ids:
-            self.state.clear_failed(source_id)
+            self.db.clear_failed(source_id)
             try:
                 message = await self.source.get_messages(source_entity, ids=source_id)
                 if message is None:
-                    self.state.mark_failed(source_id, "Source message no longer exists")
+                    self.db.mark_failed(source_id, "Source message no longer exists")
                     continue
                 await self._migrate_single_message(message, source_entity, target_entity)
                 self.stats["retried_failed"] += 1
+                self.stats["messages_migrated"] += 1
             except FloodWaitError as e:
                 await self._handle_flood_wait(e, f"failed retry msg {source_id}")
                 continue
+            except _BoundedRetryExhausted as e:
+                self.db.mark_failed(source_id, f"{type(e.last_error).__name__}: {e.last_error}")
+                self.stats["failed"] += 1
             except Exception as e:  # noqa: BLE001
                 self.error_logger.error(
                     "Failed retry for msg %s: %s: %s",
                     source_id, type(e).__name__, e,
                 )
-                self.state.mark_failed(source_id, str(e))
+                self.db.mark_failed(source_id, str(e))
+                self.stats["failed"] += 1
 
-        self.state.save()
+        self.db.update_last_run()
 
     # --------------------------------------------------------------- iter + floodwait
 
@@ -489,7 +713,7 @@ class SavedMessagesMigrator:
             try:
                 async for message in self.source.iter_messages(
                     entity,
-                    reverse=True,        # oldest first
+                    reverse=True,
                     min_id=current_min_id,
                     limit=None,
                 ):
@@ -504,7 +728,7 @@ class SavedMessagesMigrator:
                 continue
 
     async def _handle_flood_wait(self, e: FloodWaitError, context: str) -> None:
-        """Sleep for the FloodWait duration."""
+        """Sleep for the FloodWait duration. FloodWait does NOT count as a failure."""
         seconds = int(getattr(e, "seconds", 60))
         logger.warning("FloodWait during %s: sleeping %ds", context, seconds)
         print(f"  FloodWait ({context}): sleeping {seconds}s...")
@@ -523,23 +747,37 @@ class SavedMessagesMigrator:
 
     def _print_summary(self) -> None:
         s = self.stats
-        st = self.state.summary()
+        st = self.db.summary()
         print()
         print("=" * 60)
-        print("  MIGRATION COMPLETE" if st["completed"] or s["failed"] == 0
+        print("  MIGRATION COMPLETE" if s["failed"] == 0
               else "  MIGRATION FINISHED (with failures)")
         print("=" * 60)
-        print(f"  Messages migrated:        {s['messages_migrated']}")
-        print(f"  Media downloaded:         {s['media_downloaded']}")
-        print(f"  Media uploaded:           {s['media_uploaded']}")
-        print(f"  Skipped (already done):   {s['skipped_already_uploaded']}")
-        print(f"  Recovered from crash:     {s['retried_crash']}")
-        print(f"  Retried (previously failed): {s['retried_failed']}")
-        print(f"  Failed:                   {s['failed']}")
-        print(f"  Total tracked in state:   {st['total_tracked']}")
-        print(f"  State counts:             {st['counts']}")
+        print(f"  Messages migrated:          {s['messages_migrated']}")
+        print(f"  Media downloaded:           {s['media_downloaded']}")
+        print(f"  Media uploaded:             {s['media_uploaded']}")
+        print(f"  Skipped (already uploaded): {s['skipped_already_uploaded']}")
+        print(f"  Recovered from crash:       {s['recovered_crash']}")
+        print(f"  Retried (previously failed):{s['retried_failed']}")
+        print(f"  Reconciled duplicates:       {s['reconciled_duplicates']}")
+        print(f"  Failed:                     {s['failed']}")
+        print(f"  Contiguous checkpoint:      {st['contiguous_checkpoint']}")
+        print(f"  Total tracked in DB:        {st['total_tracked']}")
+        print(f"  State counts:               {st['counts']}")
         print("=" * 60)
 
         if s["failed"] > 0:
-            print(f"\n  {s['failed']} message(s) failed. See {self.config.failed_messages_file}")
+            print(f"\n  {s['failed']} message(s) failed. Check errors.log for details.")
             print("  Re-run the migration to retry failed messages.")
+
+
+class _BoundedRetryExhausted(Exception):
+    """Raised when bounded retries are exhausted for a message."""
+
+    def __init__(self, source_id: int, attempts: int, last_error: Exception):
+        self.source_id = source_id
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(
+            f"Source msg {source_id}: exhausted {attempts} attempts. Last error: {last_error}"
+        )

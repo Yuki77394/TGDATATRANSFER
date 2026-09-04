@@ -639,20 +639,37 @@ restart. The Volume MUST be manually attached in the Railway dashboard.
 
 ### Crash/resume design
 
-The migration uses a per-message state machine:
+The migration uses a **SQLite database** (`/app/data/state/migration.db`) as
+the authoritative state store, with a per-message state machine:
 
 ```
-pending → downloaded → uploading → uploaded
-    ↓          ↓            ↓
-  failed    failed       failed
+pending → downloading → downloaded → uploading → uploaded
+    ↓          ↓             ↓            ↓
+  failed    failed        failed       failed
 ```
 
-- State is persisted to `/app/data/state/migration_state.json` after every
-  transition.
-- On restart, messages in `uploading` state are detected as crash-recovery
-  candidates and re-uploaded.
-- Messages in `failed` state are retried before processing new messages.
+- State is persisted to SQLite (WAL journal mode, transactional) after every
+  transition — crash-safe by design.
+- **Contiguous checkpoint**: the resume point is the highest N where ALL
+  messages 1..N are `uploaded`. Gaps (failed messages) prevent the checkpoint
+  from advancing past them. Example: 100 uploaded, 101 failed, 102 uploaded →
+  checkpoint = 100 (NOT 102).
+- On restart, messages in `downloading`/`downloaded`/`uploading` states are
+  recovered: media is reused if valid, uploads are reconciled against recent
+  target messages to minimize duplicates.
+- Messages in `failed` state are retried (bounded by `MAX_RETRIES`) before
+  the main loop.
 - Already-`uploaded` messages are skipped (idempotent — no duplicates).
+- **Media failure ≠ text-only success**: if a message has media and the
+  download fails, the message is marked `failed` — the caption is NOT
+  uploaded without its media.
+- **`.part` file safety**: media is downloaded to `filename.ext.part` and
+  only atomically renamed to `filename.ext` after size validation passes.
+- **Bounded retries**: normal errors retry up to `MAX_RETRIES` (default 5).
+  `FloodWait` is unbounded (Telegram-required wait, not a failure).
+- **JSON → SQLite migration**: if an old `migration_state.json` exists, it's
+  automatically imported into SQLite on first run (original backed up as
+  `.json.bak`).
 
 ### First-time authentication
 

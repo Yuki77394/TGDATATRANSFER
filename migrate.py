@@ -35,7 +35,7 @@ from telethon import TelegramClient  # noqa: E402
 from telethon.sessions import StringSession  # noqa: E402
 
 from migration_config import MigrationConfig  # noqa: E402
-from migration_state import MigrationStateManager  # noqa: E402
+from migration_db import MigrationDB  # noqa: E402
 from migrator import SavedMessagesMigrator  # noqa: E402
 from utils import setup_logging  # noqa: E402
 
@@ -100,8 +100,8 @@ async def main() -> int:
     logger.info("Starting Saved Messages migration tool.")
     logger.info("Configuration: %s", config.safe_summary())
 
-    # --- State manager (resume support) ---
-    state = MigrationStateManager(config.state_file)
+    # --- State manager (SQLite, resume support) ---
+    db = MigrationDB(config.db_path)
 
     # --- Create Telegram clients ---
     source_client = TelegramClient(
@@ -164,23 +164,24 @@ async def main() -> int:
 
     # --- Run migration ---
     migrator = SavedMessagesMigrator(
-        source_client, target_client, config, state, error_logger
+        source_client, target_client, config, db, error_logger
     )
     try:
         await migrator.run()
     except KeyboardInterrupt:
         print("\nInterrupted. Saving state and exiting...")
         logger.info("Interrupted by user (SIGTERM/SIGINT).")
-        state.save()
+        db.update_last_run()
         return 130
     except Exception as e:
         logger.exception("Migration failed unexpectedly.")
         print(f"\nMigration failed: {e}", file=sys.stderr)
-        state.save()
+        db.update_last_run()
         return 1
     finally:
         await _safe_disconnect(source_client)
         await _safe_disconnect(target_client)
+        db.close()
         logger.info("Migration tool finished.")
 
     return 0
