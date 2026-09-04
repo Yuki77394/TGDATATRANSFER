@@ -533,6 +533,135 @@ Two options:
 
 ---
 
+## Railway deployment — Saved Messages Migration
+
+This repository also includes a **Saved Messages migration tool** that
+copies Saved Messages from a **source** Telegram account to a **target**
+Telegram account. This is deployed on **Railway** as a long-running worker.
+
+### Purpose
+
+```
+SOURCE account Saved Messages  →  TARGET account Saved Messages
+```
+
+Migrates: text, photos, videos, voice messages, audio/music, documents,
+GIFs/animations, and captions. Processes **Saved Messages only** — no
+private chats, groups, or channels.
+
+### Prerequisites
+
+1. A Railway account (https://railway.app).
+2. Telegram API credentials from https://my.telegram.org (`API_ID`, `API_HASH`).
+3. Two Telethon `StringSession` strings — one for the source account, one
+   for the target. Generate each locally:
+   ```bash
+   pip install -r requirements.txt
+   python generate_session.py   # run twice: once per account
+   ```
+
+### Step 1: Connect GitHub repository to Railway
+
+1. Push this repository to GitHub.
+2. Go to https://railway.app → **New Project** → **Deploy from GitHub repo**.
+3. Select your repository.
+
+### Step 2: Create a Railway service
+
+Railway will auto-detect the `railway.json` and `Procfile`. The service
+runs as a **worker** (no HTTP server).
+
+### Step 3: Add a persistent Volume (CRITICAL)
+
+**A persistent Volume is REQUIRED for crash/restart recovery.** Without it,
+all state is lost on every restart and the migration starts over.
+
+1. In the Railway dashboard, go to your service → **Settings** → **Volumes**.
+2. Click **Add Volume**.
+3. Set the mount path to: `/app/data`
+4. Railway creates a persistent volume at this path.
+
+### Step 4: Set environment variables
+
+In the Railway dashboard, go to **Variables** and add:
+
+| Variable | Required | Value |
+|----------|----------|-------|
+| `API_ID` | Yes | Your Telegram API ID (integer) |
+| `API_HASH` | Yes | Your Telegram API hash |
+| `SOURCE_SESSION` | Yes | StringSession for the source account |
+| `TARGET_SESSION` | Yes | StringSession for the target account |
+| `DATA_DIR` | Yes | `/app/data` (must match the Volume mount path) |
+
+Optional variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_RETRIES` | `3` | Retry attempts for downloads/uploads |
+| `CHECKPOINT_EVERY` | `10` | Save state every N messages |
+| `ALLOW_SAME_ACCOUNT` | `false` | Allow source=target (NOT recommended) |
+| `DELETE_AFTER_UPLOAD` | `false` | Delete local media after upload |
+
+### Step 5: Deploy
+
+1. Click **Deploy** in the Railway dashboard.
+2. Railway builds the image using Nixpacks (auto-detected from `railway.json`).
+3. The worker starts with: `python migrate.py`
+
+### Step 6: Check logs
+
+```bash
+# In the Railway dashboard, click on your service → "Logs" tab
+# Or via Railway CLI:
+railway logs
+```
+
+You should see:
+```
+[INFO] Starting Saved Messages migration tool.
+[INFO] Source authenticated: user id=111 (Source User)
+[INFO] Target authenticated: user id=222 (Target User)
+[INFO] Resuming from source message id > 0
+  Scanned: 100 | Migrated: 95 | Failed: 0 | Current source id: 100
+```
+
+### Step 7: Stop / restart
+
+- Railway sends `SIGTERM` on shutdown. The tool saves state and exits cleanly.
+- To restart: Railway dashboard → **Settings** → **Restart**.
+- To stop: scale the worker to 0 (Railway dashboard → **Settings** → **Scale**).
+
+### ⚠️ Volume requirement
+
+**Without a persistent Volume mounted at `/app/data`, crash/restart
+recovery will NOT work.** State, media, and logs would be lost on every
+restart. The Volume MUST be manually attached in the Railway dashboard.
+
+### Crash/resume design
+
+The migration uses a per-message state machine:
+
+```
+pending → downloaded → uploading → uploaded
+    ↓          ↓            ↓
+  failed    failed       failed
+```
+
+- State is persisted to `/app/data/state/migration_state.json` after every
+  transition.
+- On restart, messages in `uploading` state are detected as crash-recovery
+  candidates and re-uploaded.
+- Messages in `failed` state are retried before processing new messages.
+- Already-`uploaded` messages are skipped (idempotent — no duplicates).
+
+### First-time authentication
+
+**No interactive OTP/2FA on Railway.** You must generate `StringSession`
+strings locally and set them as `SOURCE_SESSION` and `TARGET_SESSION`
+environment variables.
+
+---
+
 ## Message format
 
 Each message is stored as one JSON object per line in `messages.jsonl` and

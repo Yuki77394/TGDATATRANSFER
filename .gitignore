@@ -36,6 +36,12 @@ errors.log
 backup.log
 backup_metadata.json
 
+# Migration persistent data (Railway Volume content - NEVER commit)
+/app/data/
+data/
+migration_state.json
+migration.log
+
 # IDE / editor
 .vscode/
 .idea/
