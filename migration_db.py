@@ -256,11 +256,22 @@ class MigrationDB:
         return row["target_message_id"] if row else None
 
     def get_contiguous_checkpoint(self) -> int:
-        """Return the highest source_message_id such that ALL messages
-        1..N are in 'uploaded' state. Returns 0 if message 1 is not uploaded.
+        """Return the highest source_message_id such that ALL discovered
+        messages with id <= N are in 'uploaded' state.
 
-        This is the SAFE resume point — we fetch messages with id > checkpoint.
-        Gaps (failed messages) prevent the checkpoint from advancing past them.
+        IMPORTANT: This is based on the ordered sequence of messages actually
+        DISCOVERED from the source, NOT on every integer ID existing. Real
+        Telegram Saved Messages can have gaps (deleted/inaccessible messages).
+
+        Example:
+            Discovered IDs: 10, 11, 15, 16
+            If 10 and 11 are uploaded, 15 is failed:
+              checkpoint = 11 (stops before the failed message)
+            If 10, 11, 15, 16 are ALL uploaded:
+              checkpoint = 16 (all discovered messages up to 16 are uploaded)
+
+        The checkpoint is stored in the ``meta`` table and updated incrementally
+        by ``_maybe_advance_checkpoint()`` after each successful upload.
         """
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key = 'contiguous_checkpoint'"
@@ -270,24 +281,29 @@ class MigrationDB:
     def _recompute_contiguous_checkpoint(self) -> int:
         """Recompute the contiguous checkpoint from scratch.
 
-        Finds the highest N where all messages 1..N are 'uploaded'.
-        """
-        # Get all uploaded message IDs sorted
-        rows = self._conn.execute(
-            "SELECT source_message_id FROM messages WHERE status = 'uploaded' ORDER BY source_message_id"
-        ).fetchall()
-        uploaded_ids = set(r["source_message_id"] for r in rows)
+        Walks the ordered list of ALL discovered message IDs (regardless of
+        status) and finds the highest N such that every discovered ID <= N
+        is in 'uploaded' state. This correctly handles gaps in Telegram IDs.
 
-        if not uploaded_ids:
+        Example:
+            Discovered IDs: 10, 11, 15, 16
+            Status: 10=uploaded, 11=uploaded, 15=failed, 16=uploaded
+            Checkpoint = 11 (stops at the first non-uploaded discovered message)
+        """
+        # Get ALL discovered message IDs in ascending order
+        rows = self._conn.execute(
+            "SELECT source_message_id, status FROM messages ORDER BY source_message_id"
+        ).fetchall()
+
+        if not rows:
             checkpoint = 0
         else:
-            # Walk from 1 upward; stop at first gap
             checkpoint = 0
-            for i in range(1, max(uploaded_ids) + 1):
-                if i in uploaded_ids:
-                    checkpoint = i
+            for row in rows:
+                if row["status"] == "uploaded":
+                    checkpoint = row["source_message_id"]
                 else:
-                    break  # gap found
+                    break  # First non-uploaded discovered message stops the checkpoint
 
         with self._conn:
             self._conn.execute(
@@ -499,28 +515,71 @@ class MigrationDB:
 
     def _maybe_advance_checkpoint(self, source_message_id: int) -> None:
         """After marking a message uploaded, advance the contiguous checkpoint
-        if this message is the next one after the current checkpoint."""
+        if this message is the next discovered message after the current checkpoint.
+
+        This handles gaps in Telegram message IDs correctly. The checkpoint
+        advances through the ordered sequence of DISCOVERED messages, not
+        through every integer.
+
+        Example:
+            Discovered IDs: 10, 11, 15, 16
+            Current checkpoint: 0
+            Mark 10 as uploaded → checkpoint advances to 10 (first discovered)
+            Mark 11 as uploaded → checkpoint advances to 11
+            Mark 15 as uploaded → checkpoint advances to 15
+            Mark 16 as uploaded → checkpoint advances to 16
+        """
         current = self.get_contiguous_checkpoint()
-        if source_message_id == current + 1:
-            # Walk forward to find the next gap
-            new_checkpoint = current
-            rows = self._conn.execute(
-                """SELECT source_message_id FROM messages
-                   WHERE source_message_id > ? AND status = 'uploaded'
-                   ORDER BY source_message_id""",
-                (current,),
-            ).fetchall()
-            uploaded_above = set(r["source_message_id"] for r in rows)
-            check = current + 1
-            while check in uploaded_above:
-                new_checkpoint = check
-                check += 1
-            if new_checkpoint > current:
-                with self._conn:
-                    self._conn.execute(
-                        "UPDATE meta SET value = ? WHERE key = 'contiguous_checkpoint'",
-                        (str(new_checkpoint),),
-                    )
+
+        # If the just-uploaded message has ID <= current, checkpoint is already
+        # ahead (e.g., message was re-uploaded after being marked failed).
+        if source_message_id <= current:
+            return
+
+        # Find the next discovered message ID after the current checkpoint
+        next_row = self._conn.execute(
+            """SELECT source_message_id FROM messages
+               WHERE source_message_id > ?
+               ORDER BY source_message_id
+               LIMIT 1""",
+            (current,),
+        ).fetchone()
+
+        if next_row is None:
+            # No discovered messages after current checkpoint — nothing to advance
+            return
+
+        next_id = next_row["source_message_id"]
+
+        # Only advance if the just-uploaded message IS the next discovered one
+        # AND it is uploaded (which it is, since we just marked it)
+        if source_message_id != next_id:
+            # The just-uploaded message is not the next in sequence.
+            # This means there's a gap in the discovered sequence (e.g., we
+            # uploaded 15 but 11 is still pending/failed). Don't advance.
+            return
+
+        # Walk forward through consecutive uploaded discovered messages
+        new_checkpoint = current
+        rows = self._conn.execute(
+            """SELECT source_message_id, status FROM messages
+               WHERE source_message_id > ?
+               ORDER BY source_message_id""",
+            (current,),
+        ).fetchall()
+
+        for row in rows:
+            if row["status"] == "uploaded":
+                new_checkpoint = row["source_message_id"]
+            else:
+                break  # Stop at first non-uploaded discovered message
+
+        if new_checkpoint > current:
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'contiguous_checkpoint'",
+                    (str(new_checkpoint),),
+                )
 
     def mark_completed(self) -> None:
         with self._conn:

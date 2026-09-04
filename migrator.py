@@ -608,7 +608,13 @@ class SavedMessagesMigrator:
         self, source_entity: Any, target_entity: Any
     ) -> None:
         """Recover messages in non-terminal states (pending, downloading,
-        downloaded, uploading) from a previous crash."""
+        downloaded, uploading) from a previous crash.
+
+        FloodWait handling: if FloodWait occurs during recovery of a message,
+        we sleep and RETRY THE SAME MESSAGE (not continue to the next one).
+        FloodWait does NOT count as a failure and does NOT increment
+        retry_count. This ensures the message is not abandoned.
+        """
         incomplete_ids = self.db.get_incomplete_message_ids()
         if not incomplete_ids:
             return
@@ -617,18 +623,38 @@ class SavedMessagesMigrator:
         print(f"  Recovering {len(incomplete_ids)} incomplete message(s) from crash...")
 
         for source_id in incomplete_ids:
-            msg_state = self.db.get_message(source_id)
-            if msg_state is None:
-                continue
+            await self._recover_single_message_with_floodwait(
+                source_id, source_entity, target_entity
+            )
 
-            status = msg_state["status"]
+        self.db.update_last_run()
+
+    async def _recover_single_message_with_floodwait(
+        self,
+        source_id: int,
+        source_entity: Any,
+        target_entity: Any,
+    ) -> None:
+        """Recover a single incomplete message, retrying on FloodWait.
+
+        FloodWait retries the SAME message (unbounded). Other errors mark
+        the message as failed and move on.
+        """
+        msg_state = self.db.get_message(source_id)
+        if msg_state is None:
+            return
+
+        status = msg_state["status"]
+
+        # Loop for FloodWait retry of the SAME message
+        while True:
             try:
                 # Re-fetch the source message
                 message = await self.source.get_messages(source_entity, ids=source_id)
                 if message is None:
                     self.db.mark_failed(source_id, "Source message no longer exists")
                     self.stats["failed"] += 1
-                    continue
+                    return
 
                 if status == "uploading":
                     # Crash during upload — attempt reconciliation first
@@ -641,7 +667,7 @@ class SavedMessagesMigrator:
                         self.db.mark_uploaded(source_id, existing_target)
                         self.stats["recovered_crash"] += 1
                         self.stats["reconciled_duplicates"] += 1
-                        continue
+                        return
                     # No reconciliation match — re-upload
                     # Fall through to full migration
 
@@ -649,13 +675,18 @@ class SavedMessagesMigrator:
                 # (download will reuse existing valid media if present)
                 await self._migrate_single_message(message, source_entity, target_entity)
                 self.stats["recovered_crash"] += 1
+                return
 
             except FloodWaitError as e:
+                # Sleep and retry the SAME message (FloodWait is NOT a failure)
                 await self._handle_flood_wait(e, f"recovery msg {source_id}")
-                continue
+                continue  # retry same message
+            except KeyboardInterrupt:
+                raise
             except _BoundedRetryExhausted as e:
                 self.db.mark_failed(source_id, f"{type(e.last_error).__name__}: {e.last_error}")
                 self.stats["failed"] += 1
+                return
             except Exception as e:  # noqa: BLE001
                 self.error_logger.error(
                     "Crash recovery failed for msg %s: %s: %s",
@@ -663,13 +694,18 @@ class SavedMessagesMigrator:
                 )
                 self.db.mark_failed(source_id, str(e))
                 self.stats["failed"] += 1
-
-        self.db.update_last_run()
+                return
 
     async def _retry_failed_messages(
         self, source_entity: Any, target_entity: Any
     ) -> None:
-        """Retry failed messages that haven't exceeded max_retries."""
+        """Retry failed messages that haven't exceeded max_retries.
+
+        FloodWait handling: if FloodWait occurs during retry of a message,
+        we sleep and RETRY THE SAME MESSAGE (not continue to the next one).
+        FloodWait does NOT count as a failure and does NOT increment
+        retry_count.
+        """
         failed_ids = self.db.get_retryable_failed_ids(self.config.max_retries)
         if not failed_ids:
             return
@@ -679,21 +715,46 @@ class SavedMessagesMigrator:
         print(f"  Retrying {len(failed_ids)} failed message(s)...")
 
         for source_id in failed_ids:
-            self.db.clear_failed(source_id)
+            await self._retry_single_failed_with_floodwait(
+                source_id, source_entity, target_entity
+            )
+
+        self.db.update_last_run()
+
+    async def _retry_single_failed_with_floodwait(
+        self,
+        source_id: int,
+        source_entity: Any,
+        target_entity: Any,
+    ) -> None:
+        """Retry a single failed message, retrying on FloodWait.
+
+        FloodWait retries the SAME message (unbounded). Other errors mark
+        the message as failed again and move on.
+        """
+        self.db.clear_failed(source_id)
+
+        # Loop for FloodWait retry of the SAME message
+        while True:
             try:
                 message = await self.source.get_messages(source_entity, ids=source_id)
                 if message is None:
                     self.db.mark_failed(source_id, "Source message no longer exists")
-                    continue
+                    return
                 await self._migrate_single_message(message, source_entity, target_entity)
                 self.stats["retried_failed"] += 1
                 self.stats["messages_migrated"] += 1
+                return
             except FloodWaitError as e:
+                # Sleep and retry the SAME message (FloodWait is NOT a failure)
                 await self._handle_flood_wait(e, f"failed retry msg {source_id}")
-                continue
+                continue  # retry same message
+            except KeyboardInterrupt:
+                raise
             except _BoundedRetryExhausted as e:
                 self.db.mark_failed(source_id, f"{type(e.last_error).__name__}: {e.last_error}")
                 self.stats["failed"] += 1
+                return
             except Exception as e:  # noqa: BLE001
                 self.error_logger.error(
                     "Failed retry for msg %s: %s: %s",
@@ -701,8 +762,7 @@ class SavedMessagesMigrator:
                 )
                 self.db.mark_failed(source_id, str(e))
                 self.stats["failed"] += 1
-
-        self.db.update_last_run()
+                return
 
     # --------------------------------------------------------------- iter + floodwait
 

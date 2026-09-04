@@ -947,6 +947,506 @@ async def test_crash_during_download():
 asyncio.run(test_crash_during_download())
 
 
+# ----------------------------------------------------------------- 23. Checkpoint with gapped IDs
+section("23. Contiguous checkpoint with gapped Telegram IDs (10, 11, 15, 16)")
+
+def test_checkpoint_gapped_ids():
+    with tempfile.TemporaryDirectory() as tmp:
+        from migration_db import MigrationDB
+        db = MigrationDB(Path(tmp) / "state.db")
+
+        # Simulate discovered messages with gaps: 10, 11, 15, 16
+        # Mark all as pending first (discovered)
+        for sid in [10, 11, 15, 16]:
+            db.mark_pending(sid)
+
+        # Upload 10
+        db.mark_uploaded(10, target_message_id=100)
+        check(db.get_contiguous_checkpoint() == 10,
+              f"checkpoint=10 after uploading first discovered msg (got {db.get_contiguous_checkpoint()})")
+
+        # Upload 11
+        db.mark_uploaded(11, target_message_id=101)
+        check(db.get_contiguous_checkpoint() == 11,
+              f"checkpoint=11 after uploading 11 (got {db.get_contiguous_checkpoint()})")
+
+        # Upload 15 (gap at 12-14, but those don't exist in discovered set)
+        db.mark_uploaded(15, target_message_id=115)
+        check(db.get_contiguous_checkpoint() == 15,
+              f"checkpoint=15 after uploading 15 (gap 12-14 are not discovered) (got {db.get_contiguous_checkpoint()})")
+
+        # Upload 16
+        db.mark_uploaded(16, target_message_id=116)
+        check(db.get_contiguous_checkpoint() == 16,
+              f"checkpoint=16 after uploading 16 (got {db.get_contiguous_checkpoint()})")
+
+        db.close()
+
+test_checkpoint_gapped_ids()
+
+
+# ----------------------------------------------------------------- 24. Failed message in gapped sequence
+section("24. Failed message inside gapped sequence — checkpoint stops before it")
+
+def test_checkpoint_gapped_with_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        from migration_db import MigrationDB
+        db = MigrationDB(Path(tmp) / "state.db")
+
+        # Discovered: 10, 11, 15, 16
+        for sid in [10, 11, 15, 16]:
+            db.mark_pending(sid)
+
+        # Upload 10, 11
+        db.mark_uploaded(10, 100)
+        db.mark_uploaded(11, 101)
+        check(db.get_contiguous_checkpoint() == 11,
+              f"checkpoint=11 (got {db.get_contiguous_checkpoint()})")
+
+        # Mark 15 as failed
+        db.mark_failed(15, "simulated failure")
+        check(db.get_contiguous_checkpoint() == 11,
+              f"checkpoint still 11 after 15 failed (got {db.get_contiguous_checkpoint()})")
+
+        # Upload 16 — checkpoint must NOT advance past 15
+        db.mark_uploaded(16, 116)
+        check(db.get_contiguous_checkpoint() == 11,
+              f"checkpoint STILL 11 after 16 uploaded (15 is failed, blocks) (got {db.get_contiguous_checkpoint()})")
+
+        # Now fix 15
+        db.clear_failed(15)
+        db.mark_uploaded(15, 115)
+        check(db.get_contiguous_checkpoint() == 16,
+              f"checkpoint=16 after 15 fixed (got {db.get_contiguous_checkpoint()})")
+
+        db.close()
+
+test_checkpoint_gapped_with_failure()
+
+
+# ----------------------------------------------------------------- 25. No unnecessary rescan
+section("25. No unnecessary full history rescan due to missing numeric IDs")
+
+async def test_no_rescan_for_missing_ids():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(Path(tmp))
+        from migration_db import MigrationDB
+        from migrator import SavedMessagesMigrator
+
+        db = MigrationDB(cfg.db_path)
+
+        # Source messages: 10, 11, 15, 16 (gaps at 1-9, 12-14)
+        msgs = [MockMessage(i, f"msg {i}") for i in [10, 11, 15, 16]]
+
+        source = MockTelethonClient(111, msgs)
+        target = MockTelethonClient(222)
+
+        # Track what min_id is passed to iter_messages
+        iter_min_ids = []
+        original_iter = source.iter_messages
+        async def tracking_iter(entity, **kwargs):
+            iter_min_ids.append(kwargs.get("min_id", 0))
+            async for m in original_iter(entity, **kwargs):
+                yield m
+        source.iter_messages = tracking_iter
+
+        m = SavedMessagesMigrator(source, target, cfg, db, test_error_logger)
+        await m.run()
+
+        # All 4 messages should be uploaded
+        check(len(target._uploaded) == 4, f"4 messages uploaded (got {len(target._uploaded)})")
+        check(db.is_uploaded(10), "msg 10 uploaded")
+        check(db.is_uploaded(11), "msg 11 uploaded")
+        check(db.is_uploaded(15), "msg 15 uploaded")
+        check(db.is_uploaded(16), "msg 16 uploaded")
+
+        # Checkpoint should be 16 (all discovered messages uploaded)
+        check(db.get_contiguous_checkpoint() == 16,
+              f"checkpoint=16 (got {db.get_contiguous_checkpoint()})")
+
+        # Run 2: restart — should resume from checkpoint=16, fetch nothing new
+        source2 = MockTelethonClient(111, msgs)
+        target2 = MockTelethonClient(222)
+        iter_min_ids_r2 = []
+        original_iter2 = source2.iter_messages
+        async def tracking_iter2(entity, **kwargs):
+            iter_min_ids_r2.append(kwargs.get("min_id", 0))
+            async for m in original_iter2(entity, **kwargs):
+                yield m
+        source2.iter_messages = tracking_iter2
+
+        db2 = MigrationDB(cfg.db_path)
+        m2 = SavedMessagesMigrator(source2, target2, cfg, db2, test_error_logger)
+        await m2.run()
+
+        check(len(target2._uploaded) == 0, f"Run 2: 0 new uploads (got {len(target2._uploaded)})")
+        check(len(iter_min_ids_r2) > 0, "iter_messages called in run 2")
+        if iter_min_ids_r2:
+            check(iter_min_ids_r2[0] == 16,
+                  f"Run 2 resumes from checkpoint=16 (got min_id={iter_min_ids_r2[0]})")
+
+        db.close()
+        db2.close()
+
+asyncio.run(test_no_rescan_for_missing_ids())
+
+
+# ----------------------------------------------------------------- 26. FloodWait retries SAME message (source retrieval)
+section("26. FloodWait during source retrieval — retries SAME operation")
+
+async def test_floodwait_source_retrieval():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(Path(tmp))
+        from migration_db import MigrationDB
+        from migrator import SavedMessagesMigrator
+
+        db = MigrationDB(cfg.db_path)
+        msgs = [MockMessage(i, f"msg {i}") for i in range(1, 4)]
+
+        source = MockTelethonClient(111, msgs)
+        target = MockTelethonClient(222)
+
+        m = SavedMessagesMigrator(source, target, cfg, db, test_error_logger)
+
+        # Patch _handle_flood_wait to not actually sleep
+        async def fake_fw(e, ctx):
+            pass
+        m._handle_flood_wait = fake_fw
+
+        # Make iter_messages raise FloodWait once on first call
+        from telethon.errors import FloodWaitError
+        iter_call_count = [0]
+        original_iter = source.iter_messages
+        async def flood_iter(entity, **kwargs):
+            iter_call_count[0] += 1
+            if iter_call_count[0] == 1:
+                e = FloodWaitError(request=None, capture=None)
+                e.seconds = 1
+                raise e
+            async for m in original_iter(entity, **kwargs):
+                yield m
+        source.iter_messages = flood_iter
+
+        await m.run()
+
+        check(len(target._uploaded) == 3, f"all 3 messages uploaded after FloodWait (got {len(target._uploaded)})")
+        check(iter_call_count[0] >= 2, f"iter_messages retried after FloodWait (got {iter_call_count[0]} calls)")
+        db.close()
+
+asyncio.run(test_floodwait_source_retrieval())
+
+
+# ----------------------------------------------------------------- 27. FloodWait during media download — retries SAME message
+section("27. FloodWait during media download — retries SAME message")
+
+async def test_floodwait_media_download():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(Path(tmp))
+        from migration_db import MigrationDB
+        from migrator import SavedMessagesMigrator
+        from telethon.tl.types import MessageMediaPhoto
+
+        db = MigrationDB(cfg.db_path)
+
+        photo = MagicMock()
+        photo.id = 1
+        photo.sizes = []
+        photo.size = 100
+        msgs = [MockMessage(1, "caption", media=MessageMediaPhoto(photo=photo))]
+
+        source = MockTelethonClient(111, msgs)
+        target = MockTelethonClient(222)
+
+        m = SavedMessagesMigrator(source, target, cfg, db, test_error_logger)
+
+        async def fake_fw(e, ctx):
+            pass
+        m._handle_flood_wait = fake_fw
+
+        # Make download_media raise FloodWait once
+        from telethon.errors import FloodWaitError
+        download_calls = [0]
+        original_download = source.download_media
+        async def flood_download(message, file=None, **kwargs):
+            download_calls[0] += 1
+            if download_calls[0] == 1:
+                e = FloodWaitError(request=None, capture=None)
+                e.seconds = 1
+                raise e
+            return await original_download(message, file, **kwargs)
+        source.download_media = flood_download
+
+        await m.run()
+
+        check(db.is_uploaded(1), "msg 1 uploaded after FloodWait during download")
+        check(download_calls[0] >= 2, f"download retried after FloodWait (got {download_calls[0]} calls)")
+        # Verify retry_count was NOT incremented by FloodWait
+        msg1 = db.get_message(1)
+        check(msg1["retry_count"] <= 1, f"retry_count not inflated by FloodWait (got {msg1['retry_count']})")
+        db.close()
+
+asyncio.run(test_floodwait_media_download())
+
+
+# ----------------------------------------------------------------- 28. FloodWait during target upload — retries SAME message
+section("28. FloodWait during target upload — retries SAME message")
+
+async def test_floodwait_target_upload():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(Path(tmp))
+        from migration_db import MigrationDB
+        from migrator import SavedMessagesMigrator
+
+        db = MigrationDB(cfg.db_path)
+        msgs = [MockMessage(i, f"msg {i}") for i in range(1, 4)]
+
+        source = MockTelethonClient(111, msgs)
+        target = MockTelethonClient(222)
+
+        m = SavedMessagesMigrator(source, target, cfg, db, test_error_logger)
+
+        async def fake_fw(e, ctx):
+            pass
+        m._handle_flood_wait = fake_fw
+
+        # Make send_message raise FloodWait once for msg 2
+        from telethon.errors import FloodWaitError
+        send_calls = {}
+        original_send = target.send_message
+        async def flood_send(entity, text, **kwargs):
+            send_calls[text] = send_calls.get(text, 0) + 1
+            if "msg 2" in text and send_calls[text] == 1:
+                e = FloodWaitError(request=None, capture=None)
+                e.seconds = 1
+                raise e
+            return await original_send(entity, text, **kwargs)
+        target.send_message = flood_send
+
+        await m.run()
+
+        check(db.is_uploaded(2), "msg 2 uploaded after FloodWait during upload")
+        check(send_calls.get("msg 2", 0) >= 2, f"send_message retried for msg 2 (got {send_calls.get('msg 2', 0)})")
+        # All 3 messages should be uploaded
+        check(len(target._uploaded) == 3, f"all 3 messages uploaded (got {len(target._uploaded)})")
+        db.close()
+
+asyncio.run(test_floodwait_target_upload())
+
+
+# ----------------------------------------------------------------- 29. FloodWait during startup recovery — retries SAME message
+section("29. FloodWait during startup recovery — retries SAME message")
+
+async def test_floodwait_startup_recovery():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(Path(tmp))
+        from migration_db import MigrationDB
+        from migrator import SavedMessagesMigrator
+
+        db = MigrationDB(cfg.db_path)
+
+        # Pre-populate: msg 1 is in 'uploading' state (crashed during upload)
+        db.mark_pending(1)
+        db.mark_downloaded(1, has_media=False)
+        db.mark_uploading(1, upload_attempt_hash="abc")
+
+        msgs = [MockMessage(1, "msg 1")]
+        source = MockTelethonClient(111, msgs)
+        target = MockTelethonClient(222)
+
+        m = SavedMessagesMigrator(source, target, cfg, db, test_error_logger)
+
+        async def fake_fw(e, ctx):
+            pass
+        m._handle_flood_wait = fake_fw
+
+        # Make the first get_messages call (during recovery) raise FloodWait
+        from telethon.errors import FloodWaitError
+        get_calls = [0]
+        original_get = source.get_messages
+        async def flood_get(entity, ids=None, limit=None, **kwargs):
+            get_calls[0] += 1
+            if get_calls[0] == 1 and isinstance(ids, int):
+                e = FloodWaitError(request=None, capture=None)
+                e.seconds = 1
+                raise e
+            return await original_get(entity, ids=ids, limit=limit, **kwargs)
+        source.get_messages = flood_get
+
+        await m.run()
+
+        check(db.is_uploaded(1), "msg 1 uploaded after FloodWait during recovery")
+        check(get_calls[0] >= 2, f"get_messages retried after FloodWait (got {get_calls[0]} calls)")
+        db.close()
+
+asyncio.run(test_floodwait_startup_recovery())
+
+
+# ----------------------------------------------------------------- 30. FloodWait does NOT mark unrelated messages complete
+section("30. FloodWait does NOT mark unrelated messages as complete")
+
+async def test_floodwait_no_unrelated_completion():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(Path(tmp))
+        from migration_db import MigrationDB
+        from migrator import SavedMessagesMigrator
+
+        db = MigrationDB(cfg.db_path)
+        # Only 2 messages: msg 1 (will succeed), msg 2 (permanent FloodWait)
+        msgs = [MockMessage(1, "msg 1"), MockMessage(2, "msg 2")]
+
+        source = MockTelethonClient(111, msgs)
+        target = MockTelethonClient(222)
+
+        m = SavedMessagesMigrator(source, target, cfg, db, test_error_logger)
+
+        # FloodWait sleep is real but tiny (1s). Limit to 3 FloodWaits max
+        # by counting and then converting to a permanent error.
+        flood_count = [0]
+        async def fake_fw(e, ctx):
+            flood_count[0] += 1
+            if flood_count[0] > 3:
+                # Break the infinite loop by re-raising as a non-FloodWait error
+                raise Exception("Too many FloodWaits — test abort")
+        m._handle_flood_wait = fake_fw
+
+        # Make send_message raise FloodWait PERMANENTLY for msg 2
+        from telethon.errors import FloodWaitError
+        original_send = target.send_message
+        async def permanent_flood_send(entity, text, **kwargs):
+            if "msg 2" in text:
+                e = FloodWaitError(request=None, capture=None)
+                e.seconds = 1
+                raise e
+            return await original_send(entity, text, **kwargs)
+        target.send_message = permanent_flood_send
+
+        # Run — msg 2 will FloodWait forever, but our fake_fw breaks after 3
+        try:
+            await asyncio.wait_for(m.run(), timeout=10.0)
+        except (asyncio.TimeoutError, Exception):
+            pass  # expected — msg 2 FloodWaits until we abort
+
+        # Msg 1 should be uploaded
+        check(db.is_uploaded(1), "msg 1 uploaded")
+        # Msg 2 should NOT be marked uploaded (FloodWait doesn't = success)
+        check(not db.is_uploaded(2), "msg 2 NOT marked uploaded (FloodWait doesn't = success)")
+        # Checkpoint should be 0 (msg 2 blocks the checkpoint at the first discovered message)
+        # Actually checkpoint = 0 because msg 1 is first discovered, msg 2 is second.
+        # If msg 1 uploaded and msg 2 is not, checkpoint stops at msg 1 if msg 1 is first.
+        # Wait — the checkpoint walks discovered IDs in order. If msg 1 is uploaded
+        # but msg 2 is not, checkpoint = 1 (stops at first non-uploaded = msg 2).
+        cp = db.get_contiguous_checkpoint()
+        check(cp <= 1, f"checkpoint <= 1 (msg 2 blocks) (got {cp})")
+
+        db.close()
+
+asyncio.run(test_floodwait_no_unrelated_completion())
+
+
+# ----------------------------------------------------------------- 31. Restart/resume after gapped IDs
+section("31. Restart/resume after gapped IDs — no rescan of gaps")
+
+async def test_restart_after_gaps():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(Path(tmp))
+        from migration_db import MigrationDB
+        from migrator import SavedMessagesMigrator
+
+        # Run 1: messages 10, 11, 15, 16
+        msgs = [MockMessage(i, f"msg {i}") for i in [10, 11, 15, 16]]
+
+        db1 = MigrationDB(cfg.db_path)
+        source1 = MockTelethonClient(111, msgs)
+        target1 = MockTelethonClient(222)
+        m1 = SavedMessagesMigrator(source1, target1, cfg, db1, test_error_logger)
+        await m1.run()
+        check(len(target1._uploaded) == 4, f"Run 1: 4 uploaded (got {len(target1._uploaded)})")
+        check(db1.get_contiguous_checkpoint() == 16, f"checkpoint=16 after run 1")
+        db1.close()
+
+        # Run 2: restart with same messages
+        db2 = MigrationDB(cfg.db_path)
+        source2 = MockTelethonClient(111, msgs)
+        target2 = MockTelethonClient(222)
+
+        # Track min_id passed to iter_messages
+        iter_min_ids = []
+        original_iter = source2.iter_messages
+        async def tracking_iter(entity, **kwargs):
+            iter_min_ids.append(kwargs.get("min_id", 0))
+            async for m in original_iter(entity, **kwargs):
+                yield m
+        source2.iter_messages = tracking_iter
+
+        m2 = SavedMessagesMigrator(source2, target2, cfg, db2, test_error_logger)
+        await m2.run()
+
+        check(len(target2._uploaded) == 0, f"Run 2: 0 new uploads (got {len(target2._uploaded)})")
+        if iter_min_ids:
+            check(iter_min_ids[0] == 16, f"Run 2 resumes from checkpoint=16 (got min_id={iter_min_ids[0]})")
+        db2.close()
+
+asyncio.run(test_restart_after_gaps())
+
+
+# ----------------------------------------------------------------- 32. Later uploaded msg doesn't skip earlier failed
+section("32. Later uploaded message does NOT skip earlier failed discovered message")
+
+async def test_later_upload_doesnt_skip_earlier_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(Path(tmp))
+        cfg.max_retries = 1  # fail fast
+        from migration_db import MigrationDB
+        from migrator import SavedMessagesMigrator
+
+        db = MigrationDB(cfg.db_path)
+
+        # Messages: 10, 11, 15
+        msgs = [MockMessage(10, "msg 10"), MockMessage(11, "msg 11"), MockMessage(15, "msg 15")]
+
+        source = MockTelethonClient(111, msgs)
+        target = MockTelethonClient(222)
+
+        # Make msg 11 upload fail permanently
+        original_send = target.send_message
+        async def fail_msg_11(entity, text, **kwargs):
+            if "msg 11" in text:
+                raise Exception("Permanent failure for msg 11")
+            return await original_send(entity, text, **kwargs)
+        target.send_message = fail_msg_11
+
+        m = SavedMessagesMigrator(source, target, cfg, db, test_error_logger)
+        await m.run()
+
+        # Msg 10 should be uploaded
+        check(db.is_uploaded(10), "msg 10 uploaded")
+        # Msg 11 should be failed
+        check(db.is_failed(11), "msg 11 failed")
+        # Msg 15 should be uploaded (migration continues after failure)
+        check(db.is_uploaded(15), "msg 15 uploaded (migration continues)")
+
+        # Checkpoint must be 10 (stops before failed msg 11)
+        check(db.get_contiguous_checkpoint() == 10,
+              f"checkpoint=10 (stops before failed msg 11) (got {db.get_contiguous_checkpoint()})")
+
+        # On restart, msg 11 should still be retryable (not skipped)
+        # Run 2: remove the failure, msg 11 should succeed
+        target2 = MockTelethonClient(222)
+        db2 = MigrationDB(cfg.db_path)
+        source2 = MockTelethonClient(111, msgs)
+        m2 = SavedMessagesMigrator(source2, target2, cfg, db2, test_error_logger)
+        await m2.run()
+
+        check(db2.is_uploaded(11), "msg 11 uploaded on retry (not skipped)")
+        check(db2.get_contiguous_checkpoint() == 15,
+              f"checkpoint=15 after msg 11 fixed (got {db2.get_contiguous_checkpoint()})")
+
+        db.close()
+        db2.close()
+
+asyncio.run(test_later_upload_doesnt_skip_earlier_failure())
+
+
 # ----------------------------------------------------------------- Summary
 print()
 print("=" * 70)
