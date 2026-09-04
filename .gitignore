@@ -1,0 +1,50 @@
+# Secrets - NEVER commit
+.env
+.env.local
+.env.*.local
+*.env
+
+# Telethon session files (contain auth tokens)
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Backup output (contains user data - NEVER commit)
+telegram_backup/
+backup_state.json
+backup_state.json.tmp
+*.media.jsonl
+*.failed_media.jsonl
+*.failed_messages.jsonl
+errors.log
+backup.log
+backup_metadata.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS
+.DS_Store
+desktop.ini
