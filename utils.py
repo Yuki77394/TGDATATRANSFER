@@ -98,16 +98,27 @@ def get_file_extension(filename: str) -> str:
     return ext.lower()
 
 
-def setup_logging(log_file: Path, level: int = logging.INFO) -> logging.Logger:
-    """Configure a project-wide logger that writes to a file (UTF-8).
+def setup_logging(log_file: Path, level: int = logging.INFO, console_level: int = logging.INFO) -> logging.Logger:
+    """Configure a project-wide logger.
 
-    Returns the named logger "telegram_backup". Handlers are added only once
-    so repeated calls don't create duplicate handlers.
+    Writes to a file (UTF-8) AND to stdout. On Heroku, stdout is captured
+    by the log drain so ``heroku logs`` shows the output.
+
+    The file handler is best-effort: if the filesystem is read-only or
+    the directory can't be created, we skip it and log only to stdout.
+
+    Args:
+        log_file: Path to the log file (best-effort; may be skipped on
+            read-only filesystems).
+        level: Minimum level for the file handler.
+        console_level: Minimum level for the stdout handler. Defaults to
+            INFO so all startup messages appear in Heroku logs.
+
+    Returns the named logger "telegram_backup". Handlers are added only
+    once so repeated calls don't create duplicate handlers.
     """
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-
     logger = logging.getLogger("telegram_backup")
-    logger.setLevel(level)
+    logger.setLevel(min(level, console_level))
 
     # Remove old handlers (e.g. when reconfigured)
     for handler in list(logger.handlers):
@@ -118,15 +129,24 @@ def setup_logging(log_file: Path, level: int = logging.INFO) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(level)
-    logger.addHandler(file_handler)
+    # File handler (best-effort)
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(level)
+        logger.addHandler(file_handler)
+    except OSError as e:
+        # Can't write to file (read-only filesystem, permissions, etc.)
+        # Log to stdout instead so the message isn't lost.
+        import sys as _sys
+        print(f"WARNING: Could not create log file {log_file}: {e}. Logging to stdout only.", file=_sys.stderr)
 
-    # Also add a console handler for visibility, but only at WARNING+ to keep stdout clean
-    console = logging.StreamHandler()
+    # Console (stdout) handler — always added so Heroku logs capture output.
+    # Use INFO level by default so startup messages appear in ``heroku logs``.
+    console = logging.StreamHandler()  # defaults to sys.stderr, but Heroku captures both
     console.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-    console.setLevel(logging.WARNING)
+    console.setLevel(console_level)
     logger.addHandler(console)
 
     # Don't propagate to root logger (avoid duplicate messages)

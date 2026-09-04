@@ -351,7 +351,10 @@ It will:
 | `API_ID`                 | —           | Telegram app ID from my.telegram.org (required).                         |
 | `API_HASH`               | —           | Telegram app hash (required, never logged).                              |
 | `PHONE`                  | —           | Your phone number in international format (required).                    |
-| `SESSION_NAME`           | `telegram_backup_session` | Name of the Telethon session file.                          |
+| `SESSION_NAME`           | `telegram_backup_session` | Name of the Telethon session file (local only).             |
+| `SESSION_STRING`         | —           | Telethon StringSession (for Heroku/cloud). Preferred over file session.  |
+| `TG_OTP_CODE`            | —           | OTP code for non-interactive first-run auth (Heroku fallback).           |
+| `TG_2FA_PASSWORD`        | —           | 2FA password for non-interactive auth (less secure; prefer SESSION_STRING). |
 | `BACKUP_SAVED_MESSAGES`  | `true`      | Back up your Saved Messages.                                             |
 | `BACKUP_PRIVATE_CHATS`   | `true`      | Back up 1-on-1 private chats.                                            |
 | `BACKUP_GROUPS`          | `false`     | Also back up small group chats (opt-in).                                 |
@@ -369,6 +372,164 @@ It will:
 | `MAX_RETRIES`            | `3`         | Number of retries for failed media downloads / network errors.           |
 | `CHECKPOINT_EVERY`       | `50`        | Save state to disk every N messages.                                     |
 | `BACKUP_DIR`             | `telegram_backup` | Output directory (relative to the project root or absolute).       |
+
+---
+
+## Heroku deployment
+
+The tool can run as a **Heroku Worker** process. The `Procfile` defines:
+
+```
+worker: python main.py
+```
+
+### ⚠️ Ephemeral filesystem limitation
+
+**Heroku's dyno filesystem is EPHEMERAL.** All files — including backup
+output, state, logs, and the Telethon session file — are **lost on every
+dyno restart or redeploy** (at least once every 24 hours).
+
+This means:
+- **Backups are NOT persistent on Heroku by default.** The tool will run,
+  download messages/media, and write them to the dyno filesystem — but they
+  will disappear on restart.
+- **Resume state is also lost**, so every restart starts from scratch
+  (re-downloading everything).
+- **The file-based Telethon session is lost**, requiring re-authentication
+  every restart (which is impossible without an interactive terminal).
+
+To work around this:
+1. Use `SESSION_STRING` (see below) — this keeps the auth in an env var
+   that survives restarts.
+2. For persistent backups, you must integrate an external storage service
+   (e.g., S3, Google Drive, Dropbox). This is NOT currently implemented;
+   the tool writes only to the local filesystem.
+3. For local persistent backups, run the tool on your own machine instead
+   of Heroku.
+
+### Prerequisites
+
+1. A Heroku account (free or paid).
+2. Your Telegram API credentials from https://my.telegram.org.
+3. The `SESSION_STRING` (generated locally — see below).
+
+### Step 1: Generate a session string locally
+
+Because Heroku has no interactive terminal, you must generate a Telethon
+session string on your local machine first:
+
+```bash
+cd telegram_backup_tool
+cp .env.example .env
+# Edit .env: fill in API_ID, API_HASH, PHONE
+pip install -r requirements.txt
+python generate_session.py
+```
+
+The script will prompt for your OTP code (and 2FA password if enabled),
+then print a session string. **Copy it** — it will be used as a Heroku
+Config Var.
+
+> **Security:** The session string grants full access to your Telegram
+> account. Treat it like a password. Never commit it to git.
+
+### Step 2: Create a Heroku app
+
+```bash
+heroku create my-telegram-backup
+```
+
+Or via the Heroku Dashboard: https://dashboard.heroku.com/new-app
+
+### Step 3: Set Config Vars
+
+```bash
+heroku config:set API_ID=your_api_id
+heroku config:set API_HASH=your_api_hash
+heroku config:set PHONE=+10000000000
+heroku config:set SESSION_STRING='the-session-string-you-generated'
+```
+
+Optional Config Vars (see Configuration reference above for all options):
+
+```bash
+heroku config:set BACKUP_DIR=/tmp/telegram_backup
+heroku config:set BACKUP_MEDIA=true
+heroku config:set DOWNLOAD_VIDEOS=true
+```
+
+### Step 4: Deploy the code
+
+**Option A — Connect GitHub repo (recommended):**
+
+1. Push the project to a GitHub repository.
+2. In the Heroku Dashboard: Settings → Deploy → Deployment method → GitHub.
+3. Connect the repository and enable Automatic Deploys (optional).
+4. Deploy the `main` branch.
+
+**Option B — Heroku Git:**
+
+```bash
+heroku git:remote -a my-telegram-backup
+git push heroku main
+```
+
+### Step 5: Start the Worker dyno
+
+```bash
+# Scale up the worker (starts it)
+heroku ps:scale worker=1
+
+# Check dyno status
+heroku ps
+```
+
+### Step 6: View logs
+
+```bash
+heroku logs --tail
+```
+
+You should see startup messages like:
+
+```
+[INFO] Starting Telegram backup tool.
+[INFO] Configuration: {'is_heroku': True, 'session_string_set': True, ...}
+[WARNING] Running on Heroku: the dyno filesystem is EPHEMERAL...
+[INFO] Authenticated as user id=... (Your Name)
+[INFO] Discovered N chats to back up.
+```
+
+### Step 7: Stop / restart the Worker
+
+```bash
+# Stop the worker (sends SIGTERM, tool saves state and exits gracefully)
+heroku ps:scale worker=0
+
+# Restart (scales down then up)
+heroku ps:restart worker
+```
+
+Heroku sends `SIGTERM` ~30 seconds before forcing `SIGKILL`. The tool
+handles `SIGTERM` by saving state and disconnecting cleanly.
+
+### First-time Telegram authentication
+
+**You cannot do interactive OTP/2FA on Heroku** — there's no terminal.
+
+Two options:
+
+1. **Preferred — `SESSION_STRING`:** Generate locally with
+   `python generate_session.py` and set as a Config Var. This contains
+   the full auth state and survives restarts.
+
+2. **Fallback — env-var auth:** Set `TG_OTP_CODE` (and `TG_2FA_PASSWORD`
+   if needed) as Config Vars. The tool will use them for non-interactive
+   first-time auth. **This is less secure** because the OTP code must be
+   set before the Telegram login code expires, and the 2FA password
+   would be stored in plaintext Config Vars. After the first successful
+   run, the session file is created — but it's lost on restart, so
+   you'd need to set the OTP again. **Prefer `SESSION_STRING`.**
 
 ---
 
